@@ -205,6 +205,14 @@ def test_streamlit_mocked_live_flow(tmp_path, monkeypatch):
     app.text_area[0].set_value("How does evidence persistence work?")
     app.button[0].click().run()
     assert not app.exception
+    # Research now runs in a background worker; wait for it before inspecting the report.
+    from coeus.jobs import active_job
+
+    current = active_job(tmp_path / "ui.sqlite3")
+    if current:
+        assert current.done.wait(5)
+    app.run()
+    assert not app.exception
     assert any("Test research report" in item.value for item in app.markdown)
     app.run()
     assert not app.exception
@@ -271,7 +279,8 @@ def test_rate_limit_respects_retry_after(monkeypatch):
         )
         try:
             assert await provider.search("test") == []
-            assert delays == [7]
+            assert delays[0] == 7
+            assert all(0 <= delay <= 2 for delay in delays[1:])
         finally:
             await provider.close()
 

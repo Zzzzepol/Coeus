@@ -8,7 +8,8 @@ from coeus.extraction import extract_chunk
 from coeus.models import Critique, Document, Evidence, Plan, Report, Source
 from coeus.providers import ProviderError, RequestTooLarge
 from coeus.report import render_report, report_claims, validate_report
-from coeus.storage import Store
+from coeus.sources import authority_hint, diverse_evidence, ranked_results
+from coeus.storage import Store, now
 
 
 def fingerprint(value: str) -> str:
@@ -27,24 +28,44 @@ class ResearchEngine:
         self.progress = progress or (lambda message: None)
 
     async def run(
-        self, question: str, documents: list[Document] | None = None, mode: str = "live"
+        self,
+        question: str,
+        documents: list[Document] | None = None,
+        mode: str = "live",
+        resume_from: str | None = None,
+        on_started=None,
     ) -> str:
+        if resume_from:
+            previous = self.store.get(resume_from)
+            question, mode = previous["question"], previous["mode"]
+            documents = [
+                Document(name=s["title"], text=s["content"])
+                for s in previous["artifacts"].get("source", {}).values()
+                if s["kind"] == "document"
+            ]
         question = question.strip()
         if not 5 <= len(question) <= 2000:
             raise ValueError("Enter a research question between 5 and 2,000 characters.")
         documents = documents or []
         if len(documents) > 5:
             raise ValueError("Upload at most five documents.")
-        if mode not in {"live", "offline"}:
+        if mode not in {"live", "offline", "hybrid"}:
             raise ValueError("Unknown run mode.")
         if mode == "offline" and not documents:
             raise ValueError("Offline research requires at least one text or Markdown document.")
-        run_id = self.store.create_run(question, mode)
+        run_id = (
+            self.store.clone_run(resume_from)
+            if resume_from
+            else self.store.create_run(question, mode)
+        )
+        if on_started:
+            on_started(run_id)
 
         def emit(message):
             self.store.event(run_id, message)
             self.progress(message)
 
+        self.provider.on_event = emit
         try:
             async with asyncio.timeout(self.settings.run_timeout):
                 await self._research(run_id, question, documents, mode, emit)
@@ -69,6 +90,7 @@ class ResearchEngine:
 
     async def _research(self, run_id, question, documents, mode, emit):
         cfg = self.settings
+        saved = self.store.get(run_id)["artifacts"]
         self.store.put(
             run_id,
             "config",
@@ -77,6 +99,8 @@ class ResearchEngine:
                 "model": cfg.llm_model if mode == "live" else cfg.ollama_model,
                 "workers": cfg.workers if mode == "live" else 1,
                 "max_tasks": cfg.max_tasks,
+                "profile": cfg.profile,
+                "preferred_domains": cfg.preferred_domains,
                 "results_per_task": cfg.results_per_task,
                 "run_timeout": cfg.run_timeout,
                 "extract_chunk_chars": cfg.extract_chunk_chars,
@@ -85,21 +109,30 @@ class ResearchEngine:
             },
         )
         plan = None
-        if mode == "live":
-            emit("Planning research tasks")
-            plan = await self.provider.generate(
-                "plan",
-                f"Create 1–{cfg.max_tasks} focused web search tasks to answer the question. "
-                "Seek primary evidence and conflicting findings. Document names are context only.",
-                {"question": question, "documents": [d.name for d in documents]},
-                Plan,
-            )
-            plan.tasks = plan.tasks[: cfg.max_tasks]
-            self.store.put(run_id, "plan", "plan", plan)
+        if mode != "offline":
+            if saved.get("plan", {}).get("plan", {}).get("tasks"):
+                plan = Plan.model_validate(saved["plan"]["plan"])
+                emit("Reusing the saved research plan")
+            else:
+                emit("Planning research tasks")
+                plan = await self.provider.generate(
+                    "plan",
+                    f"Create 1–{cfg.max_tasks} focused search tasks. Prioritize official documentation, "
+                    "original research and primary evidence. Include preferred_domains with likely "
+                    "primary-source hostnames when known; these are ranking hints, not verified authority. "
+                    "Include conflicting evidence. "
+                    "For time-sensitive claims seek dated sources; separate products from models.",
+                    {"question": question, "documents": [d.name for d in documents]},
+                    Plan,
+                )
+                plan.tasks = plan.tasks[: cfg.max_tasks]
+                self.store.put(run_id, "plan", "plan", plan)
         else:
             emit("Planning document research (offline; web search disabled)")
-        sources: dict[str, Source] = {}
-        evidence: list[Evidence] = []
+        sources = {
+            key: Source.model_validate(value) for key, value in saved.get("source", {}).items()
+        }
+        evidence = [Evidence.model_validate(value) for value in saved.get("evidence", {}).values()]
         warnings: list[str] = []
         document_sources = []
         for index, doc in enumerate(documents):
@@ -110,6 +143,16 @@ class ResearchEngine:
                 kind="document",
                 content=doc.text,
             )
+            source = next(
+                (
+                    existing
+                    for existing in sources.values()
+                    if existing.kind == "document"
+                    and existing.title == doc.name
+                    and existing.content == doc.text
+                ),
+                source,
+            )
             sources[source.id] = source
             self.store.put(run_id, "source", source.id, source)
             # Extract across the entire document, in bounded chunks rather than silently truncating it.
@@ -118,30 +161,52 @@ class ResearchEngine:
                     (source, doc.text[offset : offset + cfg.extract_chunk_chars])
                 )
 
-        queue = asyncio.Queue()
-        if plan:
-            for i, task in enumerate(plan.tasks, 1):
-                queue.put_nowait((f"T{i}", "web", task))
-        for i, chunk in enumerate(document_sources, 1):
-            queue.put_nowait((f"D{i}", "document", chunk))
-
+        specs = saved.get("task_spec", {})
+        if not specs:
+            if plan:
+                specs = {
+                    f"T{i}": {"kind": "web", **task.model_dump()}
+                    for i, task in enumerate(plan.tasks, 1)
+                }
+            for i, (source, chunk) in enumerate(document_sources, 1):
+                # Persist the exact excerpt to keep retries independent of future chunk settings.
+                specs[f"D{i}"] = {
+                    "kind": "document",
+                    "source_id": source.id,
+                    "content": chunk,
+                    "objective": source.title,
+                }
+            for key, spec in specs.items():
+                self.store.put(run_id, "task_spec", key, spec)
         if mode == "offline":
             self.store.put(
                 run_id,
                 "plan",
                 "plan",
                 {
-                    "scope": "Uploaded documents only; no web search",
+                    "scope": "Uploaded documents only",
                     "tasks": [
-                        {
-                            "id": f"D{i}",
-                            "document": source.title,
-                            "objective": "Extract evidence relevant to the research question",
-                        }
-                        for i, (source, _) in enumerate(document_sources, 1)
+                        {"id": key, "objective": spec["objective"]} for key, spec in specs.items()
                     ],
                 },
             )
+        queue = asyncio.Queue()
+        for key, spec in specs.items():
+            previous_task = saved.get("task", {}).get(key, {})
+            if (
+                previous_task.get("status") == "complete"
+                and previous_task.get("findings", 0) > 0
+                and not previous_task.get("rejected", 0)
+            ):
+                emit(f"Reusing completed task {key}")
+                continue
+            self.store.put(
+                run_id,
+                "task",
+                key,
+                {"kind": spec["kind"], "status": "queued", "objective": spec["objective"]},
+            )
+            queue.put_nowait((key, spec["kind"], spec))
 
         async def worker():
             while True:
@@ -152,34 +217,88 @@ class ResearchEngine:
                 task_info = {
                     "kind": kind,
                     "status": "running",
-                    "objective": task.objective if kind == "web" else task[0].title,
+                    "objective": task["objective"],
                 }
                 self.store.put(run_id, "task", task_id, task_info)
                 try:
                     emit(f"Researching {task_id}: {task_info['objective']}")
                     batch = []
+                    source_gap = False
                     if kind == "web":
-                        for result in await self.provider.search(task.query):
-                            uri = result.get("url", "")
-                            content = result.get("raw_content") or result.get("content") or ""
-                            if not isinstance(uri, str) or not isinstance(content, str):
-                                continue
-                            if urlsplit(uri).scheme not in {"https", "http"} or not content.strip():
-                                continue
-                            # Snapshot ID includes content so quote provenance survives changed search results.
+                        preferred = cfg.preferred_domains + task.get("preferred_domains", [])
+                        cached = saved.get("search", {}).get(task_id, {}).get("source_ids", [])
+                        if cached:
+                            candidates = [
+                                {
+                                    "url": sources[key].uri,
+                                    "title": sources[key].title,
+                                    "content": sources[key].content,
+                                    "published_date": sources[key].published_date,
+                                }
+                                for key in cached
+                                if key in sources
+                            ]
+                            emit(f"Reusing saved sources for {task_id}")
+                        else:
+                            candidates = await self.provider.search(task["query"])
+                        primary_search = getattr(self.provider, "search_primary", None)
+                        has_preferred = any(
+                            isinstance(r, dict)
+                            and isinstance(r.get("url"), str)
+                            and authority_hint(r["url"], preferred) == "preferred domain"
+                            for r in candidates
+                        )
+                        if preferred and primary_search and not has_preferred:
+                            emit(f"Checking preferred source domains for {task_id}")
+                            try:
+                                candidates = (
+                                    await primary_search(task["query"], preferred) + candidates
+                                )
+                            except ProviderError as exc:
+                                warnings.append(
+                                    f"{task_id}: preferred-source search failed ({exc}); general results used."
+                                )
+                        candidates = [
+                            r
+                            for r in candidates
+                            if isinstance(r, dict)
+                            and isinstance(r.get("raw_content") or r.get("content"), str)
+                            and (r.get("raw_content") or r.get("content")).strip()
+                        ]
+                        results = ranked_results(candidates, cfg.results_per_task, preferred)
+                        for result in results:
+                            uri = result["url"]
+                            content = result.get("raw_content") or result.get("content")
+                            date = result.get("published_date")
                             source = Source(
                                 id="S" + fingerprint(uri + content[:12_000]),
-                                title=str(result.get("title") or uri),
+                                title=str(result.get("title") or uri)[:500],
                                 uri=uri,
                                 kind="web",
                                 content=content[:12_000],
+                                domain=(urlsplit(uri).hostname or "").removeprefix("www."),
+                                retrieved_at=now(),
+                                published_date=str(date)[:80] if date else None,
+                                authority_hint=authority_hint(uri, preferred),
                             )
+                            if source.id in sources:
+                                source.retrieved_at = sources[source.id].retrieved_at
                             sources[source.id] = source
                             self.store.put(run_id, "source", source.id, source)
                             batch.append(source.model_dump())
+                        source_gap = bool(preferred) and not any(
+                            s["authority_hint"] == "preferred domain" for s in batch
+                        )
+                        if source_gap:
+                            warnings.append(
+                                f"{task_id}: no source from the requested preferred domains was found."
+                            )
+                        self.store.put(
+                            run_id, "search", task_id, {"source_ids": [s["id"] for s in batch]}
+                        )
                     else:
-                        source, chunk = task
-                        batch = [{**source.model_dump(), "content": chunk}]
+                        source = sources[task["source_id"]]
+                        batch = [{**source.model_dump(), "content": task["content"]}]
                     if not batch:
                         raise ValueError("No usable sources")
                     accepted = rejected = failed_chunks = 0
@@ -187,6 +306,15 @@ class ResearchEngine:
                         text = source_data["content"]
                         for offset in range(0, len(text), cfg.extract_chunk_chars):
                             chunk = text[offset : offset + cfg.extract_chunk_chars]
+                            checkpoint = fingerprint(
+                                task_id + source_data["id"] + str(offset) + chunk
+                            )
+                            if (
+                                saved.get("chunk", {}).get(checkpoint, {}).get("status")
+                                == "complete"
+                            ):
+                                continue
+                            chunk_rejected = chunk_failed = 0
                             # Metadata is bounded separately; identifiers and content remain exact.
                             excerpt = {
                                 **source_data,
@@ -199,11 +327,13 @@ class ResearchEngine:
                             ):
                                 if error:
                                     failed_chunks += 1
+                                    chunk_failed += 1
                                     warnings.append(f"{task_id}: {error}")
                                     continue
                                 for f in findings.findings:
                                     if f.source_id != source_data["id"] or f.quote not in chunk:
                                         rejected += 1
+                                        chunk_rejected += 1
                                         continue
                                     item = Evidence(
                                         **f.model_dump(),
@@ -215,8 +345,22 @@ class ResearchEngine:
                                         evidence.append(item)
                                         self.store.put(run_id, "evidence", item.id, item)
                                         accepted += 1
+                            self.store.put(
+                                run_id,
+                                "chunk",
+                                checkpoint,
+                                {
+                                    "task_id": task_id,
+                                    "source_id": source_data["id"],
+                                    "status": "partial"
+                                    if chunk_rejected or chunk_failed
+                                    else "complete",
+                                },
+                            )
+                    accepted = sum(e.task_id == task_id for e in evidence)
                     task_info.update(
-                        status="partial" if failed_chunks else "complete",
+                        status="partial" if failed_chunks or source_gap else "complete",
+                        source_gap=source_gap,
                         findings=accepted,
                         rejected=rejected,
                         failed_chunks=failed_chunks,
@@ -236,6 +380,9 @@ class ResearchEngine:
                 finally:
                     self.store.put(run_id, "task", task_id, task_info)
                     queue.task_done()
+                    emit(
+                        f"Task {task_id}: {task_info['status']} · {task_info.get('findings', 0)} verified findings"
+                    )
 
         async with asyncio.TaskGroup() as group:
             for _ in range(cfg.workers if mode == "live" else 1):
@@ -265,7 +412,7 @@ class ResearchEngine:
         # Explicit context budget; all evidence remains inspectable even when not synthesized.
         evidence.sort(key=lambda e: (e.task_id, e.id))
         selected, used_chars = [], 0
-        for e in evidence:
+        for e in diverse_evidence(evidence, sources):
             size = len(e.model_dump_json().encode("utf-8"))
             if used_chars + size <= cfg.evidence_budget_bytes:
                 selected.append(e)
@@ -279,10 +426,25 @@ class ResearchEngine:
                 "all findings are retained in SQLite."
             )
         self.store.put(run_id, "coverage", "research", coverage)
+        coverage["sources"] = len(sources)
+        coverage["domains"] = len(
+            {s.domain or urlsplit(s.uri).hostname for s in sources.values() if s.kind == "web"}
+        )
+        self.store.put(run_id, "coverage", "research", coverage)
         data = {
             "question": question,
             "evidence": [e.model_dump() for e in selected],
             "coverage": coverage,
+            "source_metadata": [
+                {
+                    "id": s.id,
+                    "uri": s.uri[:500],
+                    "published_date": s.published_date,
+                    "authority_hint": s.authority_hint,
+                }
+                for s in sources.values()
+                if s.id in {e.source_id for e in selected}
+            ],
             "scope": "Uploaded documents only"
             if mode == "offline"
             else "Web and uploaded documents",
@@ -294,7 +456,7 @@ class ResearchEngine:
                     "draft",
                     "Answer using only the evidence. Every claim needs valid evidence_ids. "
                     "Provide a concise direct answer in answer, with evidence_ids, then practical tradeoffs in "
-                    "claims. Prefer primary evidence. Include limitations and distinguish source statements "
+                    "at most six claims. Prefer primary evidence. Include limitations and distinguish source statements "
                     "from established conclusions. Do not repeat the answer verbatim in findings.",
                     data,
                     Report,
@@ -317,24 +479,53 @@ class ResearchEngine:
             cited = {ref for c in report_claims(report) for ref in c.evidence_ids}
             return {**data, "evidence": [e.model_dump() for e in selected if e.id in cited]}
 
+        def claim_map(report):
+            return {
+                **({"answer": report.answer.model_dump()} if report.answer else {}),
+                **{f"claim_{i}": c.model_dump() for i, c in enumerate(report.claims, 1)},
+            }
+
         async def critique(report):
             return await self.provider.generate(
                 "critic",
                 "Audit each claim against its exact evidence quotes. Flag unsupported inference, "
                 "contradictions, missing scope, and misleading certainty. Verdict must be revise "
-                "if any claim is not supported. Suggest concrete repairs.",
-                {**review_data(report), "report": report.model_dump()},
+                "if any claim is not supported. Return a claim_reviews entry for EVERY supplied "
+                "claim_id, including answer. Mark supported=false for contradictions or claims "
+                "whose cited quotes do not establish them. Suggest concrete repairs.",
+                {**review_data(report), "report": report.model_dump(), "claims": claim_map(report)},
                 Critique,
             )
 
         emit("Critic checking claims against evidence")
         review = await critique(draft)
         self.store.put(run_id, "critique", "initial", review)
-        if review.verdict == "revise" or review.issues:
+
+        def rejected_claims(report, review):
+            mapped = {}
+            duplicate = set()
+            for item in review.claim_reviews:
+                if item.claim_id in mapped:
+                    duplicate.add(item.claim_id)
+                mapped[item.claim_id] = item
+            return {
+                key: (
+                    "Critic returned duplicate assessments for this claim."
+                    if key in duplicate
+                    else mapped[key].reason
+                    if key in mapped
+                    else "No explicit support assessment was returned."
+                )
+                for key in claim_map(report)
+                if key in duplicate or key not in mapped or not mapped[key].supported
+            }
+
+        if review.verdict == "revise" or review.issues or rejected_claims(draft, review):
             emit("Revising the report from critic feedback")
             draft = await self.provider.generate(
                 "revise",
-                "Repair the draft using the critique. Remove unsupported claims. "
+                "Repair only unsupported claims identified in claim_reviews. Preserve supported claims "
+                "and their citations unchanged. Rewrite or remove unsupported claims. "
                 "Use only the supplied evidence and preserve explicit limitations.",
                 {
                     **review_data(draft),
@@ -346,11 +537,37 @@ class ResearchEngine:
             validate_report(draft, selected)
             review = await critique(draft)
             self.store.put(run_id, "critique", "final", review)
+        rejected = rejected_claims(draft, review)
+        excluded = [
+            {"claim_id": key, "text": claim_map(draft)[key]["text"], "reason": reason}
+            for key, reason in rejected.items()
+        ]
+        self.store.put(run_id, "excluded", "claims", excluded)
+        if excluded:
+            draft = draft.model_copy(
+                update={
+                    "answer": None if "answer" in rejected else draft.answer,
+                    "claims": [
+                        c for i, c in enumerate(draft.claims, 1) if f"claim_{i}" not in rejected
+                    ],
+                    "limitations": (
+                        [
+                            f"{len(excluded)} claims were removed because their evidence support was unresolved."
+                        ]
+                        + draft.limitations
+                    )[:12],
+                }
+            )
         review_status = (
-            "passed" if review.verdict == "pass" and not review.issues else "needs review"
+            "passed"
+            if review.verdict == "pass"
+            and not review.issues
+            and not excluded
+            and report_claims(draft)
+            else "needs review"
         )
         if review_status != "passed":
-            warnings += review.issues or ["The critic requested further revision."]
+            warnings += review.issues or ["The report did not receive complete per-claim approval."]
         self.store.put(run_id, "report", "final", draft)
         self.store.put(run_id, "warnings", "warnings", warnings)
         markdown = render_report(
@@ -362,6 +579,7 @@ class ResearchEngine:
             review_status,
             warnings,
             coverage,
+            excluded,
         )
         self.store.finish(
             run_id,

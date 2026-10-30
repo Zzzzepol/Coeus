@@ -2,7 +2,7 @@
 
 import asyncio
 
-from coeus.models import Claim, Critique, Finding, Findings, Plan, Report, ResearchTask
+from coeus.models import Claim, ClaimReview, Critique, Finding, Findings, Plan, Report, ResearchTask
 
 
 class FixtureProvider:
@@ -65,5 +65,15 @@ class FixtureProvider:
                 limitations=["Offline fixture run: no live search or LLM was used."],
             )
         if schema is Critique:
-            return Critique(verdict="pass", issues=[], suggestions=[])
+            return Critique(
+                verdict="pass",
+                issues=[],
+                suggestions=[],
+                claim_reviews=[
+                    ClaimReview(
+                        claim_id=key, supported=True, reason="Supported by the supplied quote"
+                    )
+                    for key in data.get("claims", {})
+                ],
+            )
         raise ValueError(operation)

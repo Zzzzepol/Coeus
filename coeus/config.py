@@ -32,6 +32,38 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen2.5-coder:3b"
     ollama_timeout: float = Field(180, ge=10, le=600)
 
+    profile: str = "custom"
+    request_interval: float = Field(1.5, ge=0, le=30, validation_alias="COEUS_REQUEST_INTERVAL")
+    preferred_domains: list[str] = Field(default_factory=list)
+
+    def with_profile(self, profile: str):
+        if profile == "quick":
+            return self.model_copy(
+                update={
+                    "profile": profile,
+                    "max_tasks": 2,
+                    "results_per_task": 2,
+                    "run_timeout": 600,
+                }
+            )
+        if profile == "thorough":
+            return self.model_copy(
+                update={
+                    "profile": profile,
+                    "max_tasks": 5,
+                    "results_per_task": 4,
+                    "run_timeout": 1200,
+                }
+            )
+        if profile != "custom":
+            raise ValueError("Unknown research profile")
+        return self.model_copy(update={"profile": profile})
+
+    def validate_hybrid(self):
+        self.validate_offline()
+        if not self.tavily_api_key.get_secret_value():
+            raise ValueError("Set TAVILY_API_KEY for local AI with web search.")
+
     def validate_offline(self) -> None:
         url = urlsplit(self.ollama_base_url)
         if (

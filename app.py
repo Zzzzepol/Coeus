@@ -1,12 +1,9 @@
-import asyncio
-
 import streamlit as st
 from pydantic import ValidationError
 
 from coeus.config import Settings
-from coeus.engine import ResearchEngine
+from coeus.jobs import active_job, start_job
 from coeus.models import Document
-from coeus.providers import create_provider
 from coeus.storage import Store
 
 st.set_page_config(page_title="Coeus · Research", page_icon="🔎", layout="wide")
@@ -19,25 +16,55 @@ except (ValidationError, OSError) as exc:
     st.error(f"Cannot initialize Coeus ({type(exc).__name__}). Check .env and the database path.")
     st.stop()
 
+job = st.session_state.get("research_job") or active_job(settings.db_path)
+if job and job.done.is_set():
+    result = job.snapshot()
+    if result["run_id"]:
+        st.session_state["selected_run"] = result["run_id"]
+    if result["error"]:
+        st.error(result["error"])
+    if result["cancelled"]:
+        st.info("Research cancelled. Completed artifacts are saved.")
+    st.session_state.pop("research_job", None)
+    job = None
+
 with st.sidebar:
     st.header("Research workspace")
     mode = st.radio(
         "Run mode",
-        ["offline", "live"],
+        ["offline", "hybrid", "live"],
         format_func=lambda m: (
             "Offline · local Ollama + documents"
             if m == "offline"
+            else "Hybrid · local Ollama + web search"
+            if m == "hybrid"
             else "Live · hosted AI + web search"
         ),
     )
-    st.caption(f"Model: {settings.ollama_model if mode == 'offline' else settings.llm_model}")
-    if mode == "offline":
+    st.caption(f"Model: {settings.llm_model if mode == 'live' else settings.ollama_model}")
+    if mode != "live":
         settings.ollama_model = st.text_input("Ollama model", value=settings.ollama_model)
         st.caption(
-            "Uses your installed Ollama model. Upload documents to research; no web search or API keys are used."
+            "Uses Ollama locally. Offline requires documents and uses no API keys. "
+            "Hybrid sends search queries to Tavily and processes results locally."
         )
     else:
         st.caption("Questions and document text go to the hosted LLM; search queries go to Tavily.")
+    profile = st.radio(
+        "Research depth",
+        ["quick", "thorough"],
+        format_func=lambda p: (
+            "Quick · 2 tasks, 2 sources/task"
+            if p == "quick"
+            else "Thorough · 5 tasks, 4 sources/task"
+        ),
+    )
+    settings = settings.with_profile(profile)
+    preferred = st.text_input(
+        "Preferred source domains (optional)", placeholder="sqlite.org, docs.python.org"
+    )
+    settings.preferred_domains = [d.strip().lower() for d in preferred.split(",") if d.strip()]
+    st.caption("Domain preferences are ranking hints, not proof that a source is correct.")
     st.caption("PDF and DOCX support are deferred. Upload .txt or .md files.")
 
 with st.form("research"):
@@ -49,7 +76,7 @@ with st.form("research"):
     uploads = st.file_uploader(
         "Research documents (required offline)", type=["txt", "md"], accept_multiple_files=True
     )
-    submitted = st.form_submit_button("Run research", type="primary")
+    submitted = st.form_submit_button("Run research", type="primary", disabled=job is not None)
 
 if submitted:
     try:
@@ -64,31 +91,44 @@ if submitted:
             docs.append(Document(name=upload.name, text=upload.getvalue().decode("utf-8")))
         if mode == "offline" and not docs:
             raise ValueError("Upload at least one text or Markdown document for offline research.")
-        with st.status("Research in progress", expanded=True) as status:
-
-            async def execute():
-                provider = create_provider(settings, mode)
-                try:
-                    return await ResearchEngine(settings, store, provider, st.write).run(
-                        question, docs, mode
-                    )
-                finally:
-                    await provider.close()
-
-            run_id = asyncio.run(execute())
-            st.session_state["selected_run"] = run_id
-            saved = store.get(run_id)
-            status.update(
-                label=f"Run {saved['status'].replace('_', ' ')}",
-                state="error" if saved["status"] == "failed" else "complete",
-                expanded=False,
-            )
+        st.session_state["research_job"] = start_job(settings, question, docs, mode)
+        st.rerun()
     except UnicodeDecodeError:
         st.error("Documents must be UTF-8 encoded text.")
     except ValidationError:
         st.error("Documents must have a name and 1–100,000 non-empty characters.")
     except ValueError as exc:
         st.error(str(exc))
+
+if job:
+    st.session_state["research_job"] = job
+
+    @st.fragment(run_every=1)
+    def show_progress():
+        snapshot = job.snapshot()
+        if snapshot["done"]:
+            st.rerun()
+        if snapshot["run_id"]:
+            progress = store.progress(snapshot["run_id"])
+            st.progress(
+                progress["finished"] / max(1, progress["total"]),
+                text=f"Research tasks: {progress['finished']}/{progress['total']}",
+            )
+            columns = st.columns(2)
+            columns[0].metric("Saved sources", progress["sources"])
+            columns[1].metric("Verified findings", progress["evidence"])
+            if progress["events"]:
+                st.info(progress["events"][-1]["message"])
+            with st.expander("Recent activity"):
+                for event in progress["events"]:
+                    st.text(event["message"])
+        else:
+            st.info("Starting research…")
+        if st.button("Cancel research", disabled=job.cancel_requested.is_set()):
+            job.cancel()
+            st.info("Cancellation requested; saving completed work.")
+
+    show_progress()
 
 runs = [run for run in store.runs() if run["mode"] != "demo"]
 if not runs:
@@ -112,9 +152,20 @@ else:
         st.error(run["error"])
     if run["status"] == "running":
         st.warning(
-            "This run is running or was interrupted before completion. Saved artifacts remain "
-            "available; interrupted runs are not automatically resumed."
+            "This run is active or was interrupted. Saved work can be resumed after the active job stops."
         )
+    if st.button(
+        "Retry incomplete work / regenerate report",
+        disabled=job is not None,
+        help="Creates a new attempt using this run's saved sources, evidence and checkpoints.",
+    ):
+        st.session_state["research_job"] = start_job(
+            settings, run["question"], mode=run["mode"], resume_from=selected
+        )
+        st.rerun()
+    parent = run["artifacts"].get("attempt", {}).get("parent")
+    if parent:
+        st.caption(f"Retry of run {parent['run_id'][:8]}; the original report is preserved.")
     coverage = run["artifacts"].get("coverage", {}).get("research")
     if coverage:
         st.caption(
@@ -154,6 +205,11 @@ else:
         for source in artifacts.get("source", {}).values():
             with st.expander(f"{source['id']} · {source['title']}"):
                 st.text(source["uri"])
+                st.caption(
+                    f"Source hint: {source.get('authority_hint', 'unverified')} · "
+                    f"Published: {source.get('published_date') or 'unknown'} · "
+                    f"Retrieved: {source.get('retrieved_at') or 'unknown'}"
+                )
                 st.text(source["content"])
     with plan_tab:
         st.json(artifacts.get("plan", {}))
@@ -162,5 +218,6 @@ else:
     with critic_tab:
         st.json(artifacts.get("critique", {}))
         st.json(artifacts.get("warnings", {}))
+        st.json(artifacts.get("excluded", {}))
     with events_tab:
         st.dataframe(run["events"], hide_index=True, use_container_width=True)

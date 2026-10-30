@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -7,7 +7,13 @@ class Model(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
+Domain = Annotated[
+    str, Field(pattern=r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$", max_length=253)
+]
+
+
 class ResearchTask(Model):
+    preferred_domains: list[Domain] = Field(default_factory=list, max_length=4)
     query: str = Field(min_length=3, max_length=500)
     objective: str = Field(min_length=3, max_length=1000)
 
@@ -27,6 +33,10 @@ class Source(Model):
     uri: str
     kind: Literal["web", "document"]
     content: str
+    domain: str = ""
+    published_date: str | None = None
+    retrieved_at: str | None = None
+    authority_hint: str = "unverified"
 
 
 class Finding(Model):
@@ -52,11 +62,18 @@ class Claim(Model):
 class Report(Model):
     title: str = Field(min_length=3, max_length=200)
     answer: Claim | None = None
-    claims: list[Claim] = Field(min_length=1, max_length=16)
+    claims: list[Claim] = Field(default_factory=list, max_length=16)
     limitations: list[str] = Field(min_length=1, max_length=12)
 
 
+class ClaimReview(Model):
+    claim_id: str = Field(min_length=1, max_length=40)
+    supported: bool
+    reason: str = Field(min_length=3, max_length=500)
+
+
 class Critique(Model):
+    claim_reviews: list[ClaimReview] = Field(default_factory=list, max_length=17)
     verdict: Literal["pass", "revise"]
     issues: list[str] = Field(max_length=12)
     suggestions: list[str] = Field(max_length=12)
