@@ -35,8 +35,10 @@ class ResearchEngine:
         documents = documents or []
         if len(documents) > 5:
             raise ValueError("Upload at most five documents.")
-        if mode not in {"live", "demo"}:
+        if mode not in {"live", "offline"}:
             raise ValueError("Unknown run mode.")
+        if mode == "offline" and not documents:
+            raise ValueError("Offline research requires at least one text or Markdown document.")
         run_id = self.store.create_run(question, mode)
 
         def emit(message):
@@ -72,8 +74,8 @@ class ResearchEngine:
             "config",
             "settings",
             {
-                "model": cfg.llm_model if mode == "live" else "offline-fixtures",
-                "workers": cfg.workers,
+                "model": cfg.llm_model if mode == "live" else cfg.ollama_model,
+                "workers": cfg.workers if mode == "live" else 1,
                 "max_tasks": cfg.max_tasks,
                 "results_per_task": cfg.results_per_task,
                 "run_timeout": cfg.run_timeout,
@@ -82,16 +84,20 @@ class ResearchEngine:
                 "llm_max_output_tokens": cfg.llm_max_output_tokens,
             },
         )
-        emit("Planning research tasks")
-        plan = await self.provider.generate(
-            "plan",
-            f"Create 1–{cfg.max_tasks} focused web search tasks to answer the question. "
-            "Seek primary evidence and conflicting findings. Document names are context only.",
-            {"question": question, "documents": [d.name for d in documents]},
-            Plan,
-        )
-        plan.tasks = plan.tasks[: cfg.max_tasks]
-        self.store.put(run_id, "plan", "plan", plan)
+        plan = None
+        if mode == "live":
+            emit("Planning research tasks")
+            plan = await self.provider.generate(
+                "plan",
+                f"Create 1–{cfg.max_tasks} focused web search tasks to answer the question. "
+                "Seek primary evidence and conflicting findings. Document names are context only.",
+                {"question": question, "documents": [d.name for d in documents]},
+                Plan,
+            )
+            plan.tasks = plan.tasks[: cfg.max_tasks]
+            self.store.put(run_id, "plan", "plan", plan)
+        else:
+            emit("Planning document research (offline; web search disabled)")
         sources: dict[str, Source] = {}
         evidence: list[Evidence] = []
         warnings: list[str] = []
@@ -113,10 +119,29 @@ class ResearchEngine:
                 )
 
         queue = asyncio.Queue()
-        for i, task in enumerate(plan.tasks, 1):
-            queue.put_nowait((f"T{i}", "web", task))
+        if plan:
+            for i, task in enumerate(plan.tasks, 1):
+                queue.put_nowait((f"T{i}", "web", task))
         for i, chunk in enumerate(document_sources, 1):
             queue.put_nowait((f"D{i}", "document", chunk))
+
+        if mode == "offline":
+            self.store.put(
+                run_id,
+                "plan",
+                "plan",
+                {
+                    "scope": "Uploaded documents only; no web search",
+                    "tasks": [
+                        {
+                            "id": f"D{i}",
+                            "document": source.title,
+                            "objective": "Extract evidence relevant to the research question",
+                        }
+                        for i, (source, _) in enumerate(document_sources, 1)
+                    ],
+                },
+            )
 
         async def worker():
             while True:
@@ -213,7 +238,7 @@ class ResearchEngine:
                     queue.task_done()
 
         async with asyncio.TaskGroup() as group:
-            for _ in range(cfg.workers):
+            for _ in range(cfg.workers if mode == "live" else 1):
                 group.create_task(worker())
         self.store.put(run_id, "warnings", "warnings", warnings)
         tasks = list(self.store.get(run_id)["artifacts"].get("task", {}).values())
@@ -258,6 +283,9 @@ class ResearchEngine:
             "question": question,
             "evidence": [e.model_dump() for e in selected],
             "coverage": coverage,
+            "scope": "Uploaded documents only"
+            if mode == "offline"
+            else "Web and uploaded documents",
         }
         emit("Writing a cited draft")
         for attempt in range(3):

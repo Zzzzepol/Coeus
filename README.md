@@ -1,8 +1,8 @@
 # Coeus
 
-A standalone local research MVP: question → plan → bounded async web/document research → SQLite evidence → cited Markdown → critic → optional revision.
+A personal research app: question → bounded research tasks → SQLite evidence → cited Markdown → critic and optional revision. Inspect sources, exact quotes, task coverage, and claim review in Streamlit.
 
-## Quick start
+## Run locally
 
 Requires Python 3.11+.
 
@@ -10,43 +10,52 @@ Requires Python 3.11+.
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
-cp .env.example .env
+# First setup only; do not overwrite an existing .env containing your keys:
+cp -n .env.example .env
 streamlit run app.py --server.address 127.0.0.1
 ```
 
-The UI defaults to an **offline demonstration** with explicitly synthetic sources. It exercises the whole pipeline without credentials. Switch to live research after setting `TAVILY_API_KEY` and `LLM_API_KEY` in `.env`. Groq is the default; configure `LLM_BASE_URL` and `LLM_MODEL` for another OpenAI-compatible chat-completions provider supporting JSON object output. Model availability depends on the provider/account.
+## Offline research with Ollama
 
-One complete run from the terminal:
+Select **Offline · local Ollama + documents**. Upload at least one UTF-8 `.txt` or `.md` document and enter a question about it. The local model extracts evidence, writes the report, and critiques it. No Tavily or hosted LLM calls occur in this mode, and no API keys are required.
+
+Start the Ollama app or run `ollama serve` in another terminal. Run `ollama list` to find the exact installed model tag, then set `OLLAMA_MODEL` in `.env` or enter it in the sidebar. The default is `qwen2.5-coder:3b`. To use Qwen 3.5 4B, install that model separately and use its exact tag from `ollama list`. Coeus never downloads models automatically.
 
 ```sh
-coeus 'How does Coeus preserve inspectable evidence?' --demo --document examples/notes.md --output reports/demo.md
-# Live (requires both API keys):
-coeus 'What are the tradeoffs of SQLite for local research tools?' --output reports/research.md
+coeus 'How does Coeus store and verify research evidence?' --offline --document README.md --output reports/local-research.md
 ```
 
-Open Streamlit to inspect previous runs, tasks, source snapshots, quotations, draft/final reports, critic feedback, and event logs. Markdown downloads include source links and exact evidence quotes. Data persists in `data/coeus.sqlite3`; no hosted database or job service is required.
+Offline mode uses a loopback Ollama address, rejects advertised cloud models, disables HTTP environment proxies, and runs one worker to limit local memory pressure. Uploaded documents are the only research source; model memory is not accepted as evidence. Smaller models can produce weaker analysis or fail structured-output validation. Review the quotes and critic feedback. Local generation may take longer; `OLLAMA_TIMEOUT` controls each request and `COEUS_RUN_TIMEOUT` bounds the whole run.
 
-## Scope and guarantees
+## Live web research
 
-- Pydantic validates plans, evidence, critic output, and reports. One structured-output retry is allowed.
-- `asyncio.Queue` and a fixed worker pool bound combined search/extraction concurrency. Default: 3 workers, 4 web tasks, 3 results per task. Task failures do not discard successful evidence.
-- Up to 5 UTF-8 `.txt`/`.md` documents, each at most 100,000 characters / 400 KB. Extraction processes one source at a time in chunks of at most 4,000 characters by default; web snapshots are capped at 12,000 characters. Documents are read as data, never executed.
-- Exact quote matching rejects invented quotations. Every report claim must reference known evidence. Citations are rendered in code, rather than trusting model-generated links. These checks establish provenance, **not factual accuracy or entailment**.
-- Research coverage is recorded separately from claim review. Failed or partial tasks, tasks without verified findings, rejected quotes, or omitted evidence produce partial coverage even when claim review passes. Coverage describes the planned tasks, not exhaustive knowledge of the topic.
-- Reports include a cited direct answer when provided by the writer, key findings, plain-language limitations, numbered evidence footnotes, and a diagnostics appendix. Stable evidence IDs remain in SQLite. Older saved reports retain their original format.
-- The critic examines claims against quotes; at most one revision and a second critic pass run. Unresolved concerns produce `needs_review`, visible in the UI/report. A critic failure fails the run and preserves the draft.
-- Sources, tasks, evidence, drafts, feedback and events persist incrementally. Empty evidence causes a failed run, never an uncited fabricated report.
-- HTTP calls have timeouts and bounded retries for transient errors. The total run deadline defaults to 600 seconds. A report uses at most 8,000 UTF-8 bytes of serialized evidence context by default; any omission is disclosed. All evidence remains in SQLite.
-- The UI executes one foreground run per session. Killing the process preserves artifacts but may leave a `running` status; resume, multi-user scheduling and distributed infrastructure are deferred. Do not expose this unauthenticated local UI publicly.
-- This MVP does not read PDF/DOCX, crawl arbitrary URLs itself, perform recursive research, or export office documents.
+Set `TAVILY_API_KEY` and `LLM_API_KEY` in `.env`, then select **Live · hosted AI + web search**. The default hosted model is `openai/gpt-oss-120b` on Groq. Other OpenAI-compatible chat-completions endpoints supporting JSON output can be configured with `LLM_BASE_URL` and `LLM_MODEL`.
 
-## Configuration
+```sh
+coeus 'What are the tradeoffs of SQLite for a personal research app?' --output reports/research.md
+```
 
-See `.env.example`. Keys are read server-side and are not stored in run artifacts. Live mode sends research queries to Tavily and question/document/evidence text to the configured hosted LLM. SQLite and downloaded reports contain your research data in plaintext. Demo mode makes no network calls.
+Live mode sends questions, uploaded document content, and evidence to the configured hosted LLM; Tavily receives search queries. Provider quotas and model availability can affect runs.
 
-For a public GitHub repository, keep credentials only in your local `.env`; `.env.example` contains empty key placeholders and is intended to be committed. Local environment files, Streamlit secrets, SQLite databases, `data/`, `reports/`, and `uploads/` are ignored by Git. Keep private input documents outside the repository or inside `uploads/`. Before committing, review `git diff --cached` to check exactly what will be published.
+## Evidence and report behavior
 
-The default maximum is 4 web jobs plus 125 document-chunk jobs. Each web page snapshot is processed in excerpts; each extraction call returns at most 6 findings. HTTP 413 triggers at most two levels of lossless excerpt splitting (at most 7 calls per initial excerpt). Successful excerpts survive a failed sibling. Draft requests rejected with 413 can halve the selected evidence up to twice, with omissions disclosed. Review calls include only cited evidence. Provider limits can still reject the minimum request; such failures remain visible. The default output allowance is 2,048 tokens per LLM call. Adjust `COEUS_EXTRACT_CHUNK_CHARS`, `COEUS_EVIDENCE_BUDGET_BYTES`, and `COEUS_LLM_MAX_OUTPUT_TOKENS` for your provider. Smaller excerpts can increase the number of calls. A successful run makes planner, extraction, writer and critic calls, with up to two additional calls for revision/review. Retries and optional document jobs increase provider usage; this is a bounded run, not a monetary budget guarantee.
+- Pydantic validates outputs. Extracted quotes must match saved source content exactly. Every report citation must reference known evidence. These checks establish provenance, not factual truth.
+- Research coverage is separate from claim review. Failed or partial tasks, missing evidence, rejected quotes, or omitted evidence produce partial coverage even when the critic passes. Coverage describes planned tasks, not exhaustive knowledge of a topic.
+- Reports use numbered citations, a direct answer when provided by the writer, findings, limitations, and an optional diagnostics appendix. Stable evidence IDs remain in SQLite.
+- The critic can trigger one revision and a second review. Remaining concerns produce `needs_review`. Failed runs retain completed artifacts for inspection.
+- Default live limits: 3 workers, 4 search tasks, 3 results per task. Up to 5 documents, each at most 100,000 characters / 400 KB. Only text and Markdown are supported.
+- Extraction sends one source excerpt at a time, at most 4,000 characters by default. Web snapshots are capped at 12,000 characters. HTTP 413 permits two levels of lossless excerpt splitting (at most 7 attempts per initial excerpt); successful excerpts survive failed siblings.
+- Report evidence has an 8,000-byte default budget. A rejected draft request may halve that evidence up to twice; omissions are disclosed. Review calls include cited evidence only. All evidence remains saved locally.
+- The default output allowance is 2,048 tokens. Tune `COEUS_EXTRACT_CHUNK_CHARS`, `COEUS_EVIDENCE_BUDGET_BYTES`, and `COEUS_LLM_MAX_OUTPUT_TOKENS` for the model. The run deadline defaults to 600 seconds.
+- One foreground run executes per Streamlit session. Interrupted runs are not automatically resumed. PDF/DOCX, deployment, and distributed infrastructure are outside this MVP.
+
+## Local data and public GitHub sharing
+
+Runs are stored in `data/coeus.sqlite3`. Database contents and downloaded reports are plaintext. Keep this personal, unauthenticated app bound to localhost.
+
+`.env.example` contains empty key placeholders and can be committed. `.env`, local environment variants, Streamlit secrets, SQLite files, `data/`, `reports/`, and `uploads/` are ignored by Git. Keep private documents outside the repository or inside `uploads/`. Review `git diff --cached` before publishing.
+
+The synthetic demo feature has been removed. Existing demo records remain in the database for history but are hidden in the UI. Your real research records and reports are preserved.
 
 ## Development
 
@@ -55,8 +64,6 @@ python -m pytest
 ruff check .
 ```
 
-Tests use deterministic providers and HTTP mocks; they do not spend API credits. The demo verifies orchestration and storage, not live provider quality. Run a live question with your keys to validate provider access and model behavior.
+Deterministic providers live only under `tests/`; tests do not spend API credits or require Ollama. Production providers are hosted AI and local Ollama. See `coeus/engine.py` for orchestration, `extraction.py` for bounded extraction, `providers.py` for APIs, and `report.py` for citation validation and rendering.
 
-Code: `coeus/engine.py` orchestrates; `providers.py` handles hosted APIs and demo fixtures; `storage.py` persists; `models.py` defines contracts; `report.py` validates and renders; `app.py` provides Streamlit; `cli.py` runs a single job.
-
-Provider contracts: [Tavily search](https://docs.tavily.com/documentation/api-reference/endpoint/search), [Groq chat completions](https://console.groq.com/docs/api-reference), [Streamlit uploads](https://docs.streamlit.io/develop/api-reference/widgets/st.file_uploader).
+API references: [Ollama](https://github.com/ollama/ollama/blob/main/docs/api.md), [Tavily](https://docs.tavily.com/documentation/api-reference/endpoint/search), [Groq](https://console.groq.com/docs/api-reference).

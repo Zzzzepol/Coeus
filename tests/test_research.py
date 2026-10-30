@@ -8,9 +8,10 @@ from streamlit.testing.v1 import AppTest
 from coeus.config import Settings
 from coeus.engine import ResearchEngine
 from coeus.models import Claim, Critique, Document, Finding, Findings, Report
-from coeus.providers import DemoProvider, HostedProvider, ProviderError
+from coeus.providers import HostedProvider, ProviderError
 from coeus.report import plain, validate_report
 from coeus.storage import Store
+from tests.fakes import FixtureProvider
 
 
 def setup(tmp_path, **overrides):
@@ -21,8 +22,8 @@ def setup(tmp_path, **overrides):
 def run(tmp_path, provider=None, docs=None, **overrides):
     cfg, store = setup(tmp_path, **overrides)
     run_id = asyncio.run(
-        ResearchEngine(cfg, store, provider or DemoProvider()).run(
-            "How is evidence stored?", docs, mode="demo"
+        ResearchEngine(cfg, store, provider or FixtureProvider()).run(
+            "How is evidence stored?", docs, mode="live"
         )
     )
     return store.get(run_id)
@@ -34,7 +35,7 @@ def test_complete_run_persists_and_cites(tmp_path):
         docs=[Document(name="notes.md", text="Local documents preserve original evidence.")],
     )
     assert result["status"] == "complete"
-    assert "DEMO" in result["report"]
+    assert "Mode:** live" in result["report"]
     assert "[^1]" in result["report"]
     assert "[^E" not in result["report"]
     assert "uploaded document" in result["report"]
@@ -45,7 +46,7 @@ def test_complete_run_persists_and_cites(tmp_path):
 
 
 def test_concurrency_is_bounded_and_documents_fully_chunked(tmp_path):
-    class Tracking(DemoProvider):
+    class Tracking(FixtureProvider):
         active = 0
         peak = 0
 
@@ -73,7 +74,7 @@ def test_concurrency_is_bounded_and_documents_fully_chunked(tmp_path):
 
 
 def test_partial_search_failure_still_produces_report(tmp_path):
-    class Partial(DemoProvider):
+    class Partial(FixtureProvider):
         async def search(self, query):
             if "bounded" in query:
                 raise ProviderError("Provider returned HTTP 503.")
@@ -88,7 +89,7 @@ def test_partial_search_failure_still_produces_report(tmp_path):
 
 
 def test_fabricated_quotes_fail_without_report(tmp_path):
-    class Fabricated(DemoProvider):
+    class Fabricated(FixtureProvider):
         async def generate(self, operation, instructions, data, schema):
             if schema is Findings:
                 return Findings(
@@ -109,7 +110,7 @@ def test_fabricated_quotes_fail_without_report(tmp_path):
 
 
 def test_critic_revision_is_bounded_and_visible(tmp_path):
-    class Skeptic(DemoProvider):
+    class Skeptic(FixtureProvider):
         revisions = 0
 
         async def generate(self, operation, instructions, data, schema):
@@ -141,7 +142,7 @@ def test_unknown_citation_is_rejected():
 
 
 def test_deadline_saves_failure(tmp_path):
-    class Slow(DemoProvider):
+    class Slow(FixtureProvider):
         async def search(self, query):
             await asyncio.sleep(5)
 
@@ -153,7 +154,7 @@ def test_deadline_saves_failure(tmp_path):
 def test_cancellation_is_saved(tmp_path):
     cfg, store = setup(tmp_path)
 
-    class Cancelled(DemoProvider):
+    class Cancelled(FixtureProvider):
         async def generate(self, *args):
             raise asyncio.CancelledError()
 
@@ -193,16 +194,18 @@ def test_http_contract_and_invalid_output_retry(tmp_path):
     asyncio.run(check())
 
 
-def test_streamlit_demo_flow(tmp_path, monkeypatch):
+def test_streamlit_mocked_live_flow(tmp_path, monkeypatch):
     monkeypatch.setenv("COEUS_DB_PATH", str(tmp_path / "ui.sqlite3"))
+    monkeypatch.setattr("coeus.providers.create_provider", lambda settings, mode: FixtureProvider())
     app = AppTest.from_file(
         Path(__file__).resolve().parents[1] / "app.py", default_timeout=15
     ).run()
     assert not app.exception
+    app.radio[0].set_value("live").run()
     app.text_area[0].set_value("How does evidence persistence work?")
     app.button[0].click().run()
     assert not app.exception
-    assert any("DEMO" in item.value for item in app.markdown)
+    assert any("Test research report" in item.value for item in app.markdown)
     app.run()
     assert not app.exception
     assert len(app.selectbox[0].options) == 1
@@ -279,7 +282,7 @@ def test_413_extraction_splits_without_dropping_text():
     from coeus.extraction import extract_chunk
     from coeus.providers import RequestTooLarge
 
-    class Limited(DemoProvider):
+    class Limited(FixtureProvider):
         def __init__(self):
             self.accepted = []
             self.calls = 0
@@ -309,7 +312,7 @@ def test_permanent_413_is_bounded():
     from coeus.extraction import extract_chunk
     from coeus.providers import RequestTooLarge
 
-    class Limited(DemoProvider):
+    class Limited(FixtureProvider):
         calls = 0
 
         async def generate(self, *args):
@@ -332,7 +335,7 @@ def test_permanent_413_is_bounded():
 def test_draft_413_reduces_context_and_discloses_partial_coverage(tmp_path):
     from coeus.providers import RequestTooLarge
 
-    class Limited(DemoProvider):
+    class Limited(FixtureProvider):
         def __init__(self):
             self.sizes = []
 
@@ -400,3 +403,130 @@ def test_http_413_is_not_retried_unchanged():
             await provider.close()
 
     asyncio.run(check())
+
+
+def test_offline_run_uses_documents_without_search_or_planning_calls(tmp_path):
+    class LocalFixture(FixtureProvider):
+        async def search(self, query):
+            raise AssertionError("Offline run attempted web search")
+
+        async def generate(self, operation, instructions, data, schema):
+            assert operation != "plan"
+            return await super().generate(operation, instructions, data, schema)
+
+    cfg, store = setup(tmp_path)
+    provider = LocalFixture()
+    run_id = asyncio.run(
+        ResearchEngine(cfg, store, provider).run(
+            "Where is evidence stored?",
+            [
+                Document(
+                    name="notes.md", text="SQLite stores evidence locally for later inspection."
+                )
+            ],
+            mode="offline",
+        )
+    )
+    result = store.get(run_id)
+    assert result["status"] == "complete"
+    assert result["mode"] == "offline"
+    assert "No web search was performed" in result["report"]
+    assert all(s["kind"] == "document" for s in result["artifacts"]["source"].values())
+    assert result["artifacts"]["config"]["settings"]["workers"] == 1
+
+
+def test_offline_run_requires_documents_before_creating_run(tmp_path):
+    cfg, store = setup(tmp_path)
+    with pytest.raises(ValueError, match="requires at least one"):
+        asyncio.run(
+            ResearchEngine(cfg, store, FixtureProvider()).run("A valid question", mode="offline")
+        )
+    assert not store.runs()
+
+
+@pytest.mark.parametrize(
+    "url", ["https://example.com", "http://localhost.example.com", "http://127.0.0.1?proxy=remote"]
+)
+def test_offline_rejects_remote_endpoint(url):
+    from coeus.providers import OllamaProvider
+
+    with pytest.raises(ValueError, match="local HTTP"):
+        OllamaProvider(Settings(_env_file=None, OLLAMA_BASE_URL=url))
+
+
+def test_ollama_native_api_stays_local_and_uses_schema():
+    import json
+
+    from coeus.providers import OllamaProvider
+
+    async def check():
+        provider = OllamaProvider(
+            Settings(
+                _env_file=None,
+                OLLAMA_MODEL="qwen2.5-coder:3b",
+                LLM_API_KEY="must-not-be-sent",
+                TAVILY_API_KEY="must-not-be-sent",
+            )
+        )
+        await provider.client.aclose()
+        paths = []
+
+        def handler(request):
+            assert request.url.host == "127.0.0.1"
+            assert "authorization" not in request.headers
+            assert b"must-not-be-sent" not in request.content
+            paths.append(request.url.path)
+            if request.url.path == "/api/show":
+                return httpx.Response(200, json={"details": {"family": "qwen2"}})
+            payload = json.loads(request.content)
+            assert payload["format"] == Critique.model_json_schema()
+            assert payload["stream"] is False
+            assert payload["think"] is False
+            return httpx.Response(
+                200,
+                json={"message": {"content": '{"verdict":"pass","issues":[],"suggestions":[]}'}},
+            )
+
+        provider.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            assert (await provider.generate("critic", "Review", {}, Critique)).verdict == "pass"
+            with pytest.raises(ProviderError, match="disabled"):
+                await provider.search("web query")
+            assert paths == ["/api/show", "/api/chat"]
+        finally:
+            await provider.close()
+
+    asyncio.run(check())
+
+
+def test_ollama_rejects_cloud_backed_alias():
+    from coeus.providers import OllamaProvider
+
+    async def check():
+        provider = OllamaProvider(Settings(_env_file=None))
+        await provider.client.aclose()
+        provider.client = httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"remote_host": "https://ollama.com"})
+            )
+        )
+        try:
+            with pytest.raises(ProviderError, match="downloaded local"):
+                await provider.generate("critic", "Review", {}, Critique)
+        finally:
+            await provider.close()
+
+    asyncio.run(check())
+
+
+def test_offline_ui_requires_documents_and_has_no_demo_option(tmp_path, monkeypatch):
+    monkeypatch.setenv("COEUS_DB_PATH", str(tmp_path / "offline-ui.sqlite3"))
+    app = AppTest.from_file(
+        Path(__file__).resolve().parents[1] / "app.py", default_timeout=15
+    ).run()
+    assert app.radio[0].value == "offline"
+    assert not any("demonstration" in option.lower() for option in app.radio[0].options)
+    app.text_area[0].set_value("What do my documents establish?")
+    app.button[0].click().run()
+    assert not app.exception
+    assert any("Upload at least one" in error.value for error in app.error)

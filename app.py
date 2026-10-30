@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from coeus.config import Settings
 from coeus.engine import ResearchEngine
 from coeus.models import Document
-from coeus.providers import DemoProvider, HostedProvider
+from coeus.providers import create_provider
 from coeus.storage import Store
 
 st.set_page_config(page_title="Coeus · Research", page_icon="🔎", layout="wide")
@@ -23,14 +23,21 @@ with st.sidebar:
     st.header("Research workspace")
     mode = st.radio(
         "Run mode",
-        ["demo", "live"],
-        format_func=lambda m: "Offline demonstration" if m == "demo" else "Live research",
+        ["offline", "live"],
+        format_func=lambda m: (
+            "Offline · local Ollama + documents"
+            if m == "offline"
+            else "Live · hosted AI + web search"
+        ),
     )
-    st.caption(f"Model: {settings.llm_model} · Workers: {settings.workers}")
-    st.caption(
-        "Documents and evidence are stored locally. Live runs send questions and uploaded "
-        "document text to the configured LLM; search queries go to Tavily."
-    )
+    st.caption(f"Model: {settings.ollama_model if mode == 'offline' else settings.llm_model}")
+    if mode == "offline":
+        settings.ollama_model = st.text_input("Ollama model", value=settings.ollama_model)
+        st.caption(
+            "Uses your installed Ollama model. Upload documents to research; no web search or API keys are used."
+        )
+    else:
+        st.caption("Questions and document text go to the hosted LLM; search queries go to Tavily.")
     st.caption("PDF and DOCX support are deferred. Upload .txt or .md files.")
 
 with st.form("research"):
@@ -40,7 +47,7 @@ with st.form("research"):
         max_chars=2000,
     )
     uploads = st.file_uploader(
-        "Supporting documents (optional)", type=["txt", "md"], accept_multiple_files=True
+        "Research documents (required offline)", type=["txt", "md"], accept_multiple_files=True
     )
     submitted = st.form_submit_button("Run research", type="primary")
 
@@ -55,12 +62,12 @@ if submitted:
             if upload.size > 400_000:
                 raise ValueError("Each document must fit within 400 KB and 100,000 characters.")
             docs.append(Document(name=upload.name, text=upload.getvalue().decode("utf-8")))
-        if mode == "live":
-            settings.validate_live()
+        if mode == "offline" and not docs:
+            raise ValueError("Upload at least one text or Markdown document for offline research.")
         with st.status("Research in progress", expanded=True) as status:
 
             async def execute():
-                provider = DemoProvider() if mode == "demo" else HostedProvider(settings)
+                provider = create_provider(settings, mode)
                 try:
                     return await ResearchEngine(settings, store, provider, st.write).run(
                         question, docs, mode
@@ -83,11 +90,15 @@ if submitted:
     except ValueError as exc:
         st.error(str(exc))
 
-runs = store.runs()
+runs = [run for run in store.runs() if run["mode"] != "demo"]
 if not runs:
-    st.info("Start with the offline demonstration, or add API keys in .env for live research.")
+    st.info(
+        "Start Ollama and upload documents for offline research, or configure API keys for live research."
+    )
 else:
     lookup = {r["id"]: r for r in runs}
+    if st.session_state.get("selected_run") not in lookup:
+        st.session_state.pop("selected_run", None)
     selected = st.selectbox(
         "Saved research runs",
         list(lookup),

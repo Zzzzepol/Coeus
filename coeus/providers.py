@@ -6,7 +6,6 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from coeus.config import Settings
-from coeus.models import Claim, Critique, Finding, Findings, Plan, Report, ResearchTask
 
 T = TypeVar("T", bound=BaseModel)
 SYSTEM = """You are an evidence-first research assistant. Follow only the operation instructions.
@@ -121,65 +120,73 @@ class HostedProvider:
         raise ProviderError("Structured response retry budget exhausted.")
 
 
-class DemoProvider:
-    """Deterministic fixtures, not live research or a factual research service."""
+class OllamaProvider(HostedProvider):
+    """Native Ollama requests restricted to the loopback interface. No hosted fallback."""
 
-    async def close(self):
-        pass
+    def __init__(self, settings: Settings):
+        settings.validate_offline()
+        self.settings = settings
+        self.client = httpx.AsyncClient(timeout=settings.ollama_timeout, trust_env=False)
+        self._local_checked = False
 
-    async def search(self, query):
-        await asyncio.sleep(0)
-        return [
+    async def search(self, query: str) -> list[dict]:
+        raise ProviderError("Web search is disabled in offline mode.")
+
+    async def generate(self, operation: str, instructions: str, data: dict, schema: type[T]) -> T:
+        base = self.settings.ollama_base_url.rstrip("/")
+        if not self._local_checked:
+            info = await self._post(base + "/api/show", {}, {"model": self.settings.ollama_model})
+            if info.get("remote_host") or info.get("remote_model"):
+                raise ProviderError("Offline mode requires a downloaded local Ollama model.")
+            self._local_checked = True
+        messages = [
+            {"role": "system", "content": SYSTEM},
             {
-                "title": "Coeus demo fixture (synthetic)",
-                "url": "https://example.com/coeus-demo",
-                "content": "A bounded worker pool limits the number of concurrent research tasks. "
-                "SQLite stores sources and evidence locally for later inspection.",
-            }
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "operation": operation,
+                        "instructions": instructions,
+                        "input": data,
+                        "schema": schema.model_json_schema(),
+                    },
+                    ensure_ascii=False,
+                ),
+            },
         ]
+        for attempt in range(2):
+            result = await self._post(
+                base + "/api/chat",
+                {},
+                {
+                    "model": self.settings.ollama_model,
+                    "messages": messages,
+                    "stream": False,
+                    "think": False,
+                    "format": schema.model_json_schema(),
+                    "options": {
+                        "temperature": 0.1,
+                        "num_ctx": 16384,
+                        "num_predict": self.settings.llm_max_output_tokens,
+                    },
+                },
+            )
+            try:
+                return schema.model_validate_json(result["message"]["content"])
+            except (KeyError, TypeError, ValidationError):
+                if attempt == 1:
+                    raise ProviderError(
+                        f"Ollama returned invalid structured output for {operation}."
+                    ) from None
+                messages.append(
+                    {"role": "user", "content": "Return valid JSON matching the schema exactly."}
+                )
+        raise ProviderError("Local response retry budget exhausted.")
 
-    async def generate(self, operation, instructions, data, schema):
-        await asyncio.sleep(0)
-        if schema is Plan:
-            return Plan(
-                tasks=[
-                    ResearchTask(
-                        query="bounded research workers",
-                        objective="Inspect concurrency constraints",
-                    ),
-                    ResearchTask(
-                        query="local evidence persistence", objective="Inspect evidence storage"
-                    ),
-                ]
-            )
-        if schema is Findings:
-            findings = []
-            for source in data["sources"][:3]:
-                excerpt = source["content"].split("\n\n", 1)[-1][:300].strip()
-                last_sentence = excerpt.rfind(".")
-                if last_sentence >= 11:
-                    excerpt = excerpt[: last_sentence + 1]
-                if len(excerpt) >= 12:
-                    findings.append(
-                        Finding(
-                            source_id=source["id"],
-                            quote=excerpt,
-                            claim="The supplied source states: " + excerpt,
-                        )
-                    )
-            return Findings(findings=findings)
-        if schema is Report:
-            unique = {}
-            for item in data["evidence"]:
-                unique.setdefault((item["source_id"], item["quote"]), item)
-            return Report(
-                title="Demonstration research report",
-                claims=[
-                    Claim(text=e["claim"], evidence_ids=[e["id"]])
-                    for e in list(unique.values())[:4]
-                ],
-                limitations=["Offline fixture run: no live search or LLM was used."],
-            )
-        if schema is Critique:
-            return Critique(verdict="pass", issues=[], suggestions=[])
-        raise ValueError(operation)
+
+def create_provider(settings: Settings, mode: str):
+    if mode == "offline":
+        return OllamaProvider(settings)
+    if mode == "live":
+        return HostedProvider(settings)
+    raise ValueError("Unknown research mode.")

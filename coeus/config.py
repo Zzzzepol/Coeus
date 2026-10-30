@@ -28,6 +28,29 @@ class Settings(BaseSettings):
         2048, ge=512, le=4096, validation_alias="COEUS_LLM_MAX_OUTPUT_TOKENS"
     )
 
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_model: str = "qwen2.5-coder:3b"
+    ollama_timeout: float = Field(180, ge=10, le=600)
+
+    def validate_offline(self) -> None:
+        url = urlsplit(self.ollama_base_url)
+        if (
+            url.scheme != "http"
+            or url.hostname not in {"localhost", "127.0.0.1", "::1"}
+            or url.username
+            or url.password
+            or url.query
+            or url.fragment
+            or url.path not in {"", "/"}
+        ):
+            raise ValueError(
+                "OLLAMA_BASE_URL must be a local HTTP address, such as http://127.0.0.1:11434."
+            )
+        if "cloud" in self.ollama_model.lower():
+            raise ValueError(
+                "Offline mode requires a locally installed model, not an Ollama cloud model."
+            )
+
     def validate_live(self) -> None:
         if not self.tavily_api_key.get_secret_value() or not self.llm_api_key.get_secret_value():
             raise ValueError("Set TAVILY_API_KEY and LLM_API_KEY in .env for live research.")
