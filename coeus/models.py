@@ -51,6 +51,7 @@ class Claim(Model):
 
 class Report(Model):
     title: str = Field(min_length=3, max_length=200)
+    answer: Claim | None = None
     claims: list[Claim] = Field(min_length=1, max_length=16)
     limitations: list[str] = Field(min_length=1, max_length=12)
 

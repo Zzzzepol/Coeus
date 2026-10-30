@@ -5,13 +5,17 @@ from coeus.models import Evidence, Report, Source
 
 
 def plain(text: str) -> str:
-    """Keep model/source text from adding Markdown links, HTML, or fake citations."""
+    """Prevent source/model text from injecting links, HTML, or citations."""
     return re.sub(r"([\\`*_{}\[\]<>#!|])", r"\\\1", " ".join(text.split()))
+
+
+def report_claims(report):
+    return ([report.answer] if report.answer else []) + report.claims
 
 
 def validate_report(report: Report, evidence: list[Evidence]):
     known = {e.id for e in evidence}
-    for claim in report.claims:
+    for claim in report_claims(report):
         if any(ref not in known for ref in claim.evidence_ids):
             raise ValueError("Report references unknown evidence identifiers.")
 
@@ -24,36 +28,88 @@ def render_report(
     mode: str,
     review: str,
     warnings: list[str],
+    coverage: dict | None = None,
 ) -> str:
     validate_report(report, evidence)
     by_id = {e.id: e for e in evidence}
     source_map = {s.id: s for s in sources}
-    used = list(dict.fromkeys(ref for c in report.claims for ref in c.evidence_ids))
+    used = list(dict.fromkeys(ref for c in report_claims(report) for ref in c.evidence_ids))
+    numbers = {ref: i for i, ref in enumerate(used, 1)}
+
+    def cited(claim):
+        refs = " ".join(f"[^{numbers[ref]}]" for ref in dict.fromkeys(claim.evidence_ids))
+        return f"{plain(claim.text)} {refs}"
+
     lines = [
         f"# {plain(report.title)}",
         "",
         f"**Question:** {plain(question)}",
         "",
-        f"**Mode:** {mode} · **Critic:** {review}",
+        f"**Mode:** {mode}",
+        "",
+    ]
+    if coverage:
+        lines += [
+            (
+                f"**Research coverage:** {coverage['status']} — "
+                f"{coverage['completed']} of {coverage['total']} tasks completed; "
+                f"{coverage['with_evidence']} produced verified evidence."
+            ),
+            "",
+        ]
+    else:
+        lines += ["**Research coverage:** not assessed for this saved report.", ""]
+    lines += [
+        f"**Claim review:** {review} for the included claims.",
+        "",
+        "Task coverage and claim review do not guarantee exhaustive research or factual accuracy.",
         "",
     ]
     if mode == "demo":
-        lines += ["> DEMO — synthetic fixtures; this is not a live research result.", ""]
-    lines += ["## Findings", ""]
+        lines += ["> DEMO — synthetic fixtures; no live research or AI review was performed.", ""]
+    if report.answer:
+        lines += ["## Answer", "", cited(report.answer), ""]
+    lines += ["## Key findings", ""]
     for claim in report.claims:
-        refs = " ".join(f"[^{ref}]" for ref in dict.fromkeys(claim.evidence_ids))
-        lines += [f"- {plain(claim.text)} {refs}", ""]
+        lines += [f"- {cited(claim)}", ""]
     lines += ["## Limitations", ""]
-    for item in report.limitations + warnings:
+    for item in report.limitations:
         lines.append(f"- {plain(item)}")
-    lines += ["", "## Evidence and sources", ""]
+    if coverage:
+        if coverage["failed"]:
+            lines.append(
+                f"- {coverage['failed']} research tasks failed or processed only part of their sources."
+            )
+        if coverage["rejected"]:
+            lines.append(
+                f"- {coverage['rejected']} extracted findings could not be verified and were excluded."
+            )
+        if coverage.get("evidence_used", 0) < coverage.get("evidence_collected", 0):
+            lines.append(
+                f"- The report uses {coverage['evidence_used']} of "
+                f"{coverage['evidence_collected']} findings to fit the model context budget. "
+                "All findings remain available in the app."
+            )
+    lines += [
+        "- Sources may be excerpts or truncated pages. Citations establish provenance, not truth.",
+        "",
+        "## Evidence and sources",
+        "",
+    ]
     for ref in used:
         e = by_id[ref]
         s = source_map[e.source_id]
-        uri = s.uri
-        if s.kind == "web" and urlsplit(uri).scheme in {"http", "https"}:
-            label = f"[{plain(s.title)}]({quote(uri, safe=':/?=&%+#@')})"
+        if s.kind == "web" and urlsplit(s.uri).scheme in {"http", "https"}:
+            label = f"[{plain(s.title)}]({quote(s.uri, safe=':/?=&%+#@')})"
         else:
             label = f"{plain(s.title)} (uploaded document)"
-        lines += [f"[^{ref}]: {label} — “{plain(e.quote)}”", ""]
+        lines += [f"[^{numbers[ref]}]: {label} — “{plain(e.quote)}”", ""]
+    if warnings:
+        lines += [
+            "## Appendix: run diagnostics",
+            "",
+            "Technical details are retained here for troubleshooting.",
+            "",
+        ]
+        lines += [f"- {plain(w)}" for w in dict.fromkeys(warnings)]
     return "\n".join(lines)

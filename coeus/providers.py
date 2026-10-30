@@ -20,6 +20,10 @@ class ProviderError(RuntimeError):
     pass
 
 
+class RequestTooLarge(ProviderError):
+    """A request must be reduced, not retried unchanged."""
+
+
 class HostedProvider:
     def __init__(self, settings: Settings):
         settings.validate_live()
@@ -41,6 +45,8 @@ class HostedProvider:
                         pass
                     await asyncio.sleep(min(delay, 60))
                     continue
+                if response.status_code == 413:
+                    raise RequestTooLarge("Provider rejected an oversized request (HTTP 413).")
                 response.raise_for_status()
                 return response.json()
             except httpx.HTTPStatusError as exc:
@@ -81,7 +87,9 @@ class HostedProvider:
                         "instructions": instructions,
                         "input": data,
                         "schema": schema.model_json_schema(),
-                    }
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
                 ),
             },
         ]
@@ -93,7 +101,7 @@ class HostedProvider:
                     "model": self.settings.llm_model,
                     "messages": messages,
                     "temperature": 0.1,
-                    "max_tokens": 4096,
+                    "max_tokens": self.settings.llm_max_output_tokens,
                     "response_format": {"type": "json_object"},
                 },
             )

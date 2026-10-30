@@ -104,6 +104,17 @@ else:
             "This run is running or was interrupted before completion. Saved artifacts remain "
             "available; interrupted runs are not automatically resumed."
         )
+    coverage = run["artifacts"].get("coverage", {}).get("research")
+    if coverage:
+        st.caption(
+            f"Research coverage: {coverage['status']} · "
+            f"{coverage['completed']}/{coverage['total']} tasks completed · "
+            f"{coverage['with_evidence']} with verified evidence"
+        )
+        if coverage["status"] == "partial":
+            st.warning(
+                "Research coverage is partial. A passing claim review applies only to included claims."
+            )
     if run["status"] == "needs_review":
         st.warning(
             "The critic still has concerns. Read the critique before relying on this report."

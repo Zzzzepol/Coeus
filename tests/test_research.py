@@ -35,7 +35,8 @@ def test_complete_run_persists_and_cites(tmp_path):
     )
     assert result["status"] == "complete"
     assert "DEMO" in result["report"]
-    assert "[^E" in result["report"]
+    assert "[^1]" in result["report"]
+    assert "[^E" not in result["report"]
     assert "uploaded document" in result["report"]
     assert set(result["artifacts"]) >= {"source", "evidence", "plan", "critique", "report", "task"}
     assert Store(tmp_path / "research.sqlite3").get(result["id"]) == result
@@ -66,7 +67,7 @@ def test_concurrency_is_bounded_and_documents_fully_chunked(tmp_path):
     provider = Tracking()
     text = "Evidence from a document. " * 1000
     result = run(tmp_path, provider, [Document(name="long.md", text=text)], COEUS_WORKERS=2)
-    assert result["status"] == "complete"
+    assert result["status"] in {"complete", "partial"}
     assert provider.peak == 2
     assert "".join(provider.chunks) == text.strip()
 
@@ -79,7 +80,9 @@ def test_partial_search_failure_still_produces_report(tmp_path):
             return await super().search(query)
 
     result = run(tmp_path, Partial())
-    assert result["status"] == "complete"
+    assert result["status"] == "partial"
+    assert result["artifacts"]["coverage"]["research"]["completed"] == 1
+    assert "Claim review:** passed" in result["report"]
     assert "research failed" in result["report"]
     assert result["artifacts"]["task"]["T1"]["status"] == "failed"
 
@@ -266,6 +269,133 @@ def test_rate_limit_respects_retry_after(monkeypatch):
         try:
             assert await provider.search("test") == []
             assert delays == [7]
+        finally:
+            await provider.close()
+
+    asyncio.run(check())
+
+
+def test_413_extraction_splits_without_dropping_text():
+    from coeus.extraction import extract_chunk
+    from coeus.providers import RequestTooLarge
+
+    class Limited(DemoProvider):
+        def __init__(self):
+            self.accepted = []
+            self.calls = 0
+
+        async def generate(self, operation, instructions, data, schema):
+            self.calls += 1
+            content = data["sources"][0]["content"]
+            if len(content) > 1000:
+                raise RequestTooLarge("oversized")
+            self.accepted.append(content)
+            return Findings(findings=[])
+
+    async def check():
+        provider = Limited()
+        text = "a" * 2000 + "b" * 2000
+        results = [
+            r async for r in extract_chunk(provider, "question", {"id": "S1", "content": text})
+        ]
+        assert "".join(provider.accepted) == text
+        assert provider.calls == 7
+        assert all(error is None for _, error in results)
+
+    asyncio.run(check())
+
+
+def test_permanent_413_is_bounded():
+    from coeus.extraction import extract_chunk
+    from coeus.providers import RequestTooLarge
+
+    class Limited(DemoProvider):
+        calls = 0
+
+        async def generate(self, *args):
+            self.calls += 1
+            raise RequestTooLarge("oversized")
+
+    async def check():
+        provider = Limited()
+        results = [
+            r
+            async for r in extract_chunk(provider, "question", {"id": "S1", "content": "x" * 4000})
+        ]
+        assert provider.calls == 7
+        assert len(results) == 4
+        assert all(error for _, error in results)
+
+    asyncio.run(check())
+
+
+def test_draft_413_reduces_context_and_discloses_partial_coverage(tmp_path):
+    from coeus.providers import RequestTooLarge
+
+    class Limited(DemoProvider):
+        def __init__(self):
+            self.sizes = []
+
+        async def generate(self, operation, instructions, data, schema):
+            if operation == "draft":
+                self.sizes.append(len(data["evidence"]))
+                if len(data["evidence"]) > 1:
+                    raise RequestTooLarge("oversized")
+            return await super().generate(operation, instructions, data, schema)
+
+    provider = Limited()
+    result = run(tmp_path, provider)
+    assert provider.sizes == [2, 1]
+    assert result["status"] == "partial"
+    assert "1 of 2 findings" in result["report"]
+    assert "Claim review:** passed" in result["report"]
+    assert len(result["artifacts"]["evidence"]) == 2
+
+
+def test_answer_citations_are_validated_and_numbered():
+    from coeus.models import Evidence, Source
+    from coeus.report import render_report
+
+    evidence = Evidence(
+        id="Elong",
+        task_id="T1",
+        source_id="S1",
+        quote="An exact source quotation.",
+        claim="Supported claim",
+    )
+    source = Source(
+        id="S1", title="Source", uri="https://example.com", kind="web", content=evidence.quote
+    )
+    claim = Claim(text="A direct answer.", evidence_ids=["Elong"])
+    report = Report(
+        title="Report title", answer=claim, claims=[claim], limitations=["Limited scope"]
+    )
+    output = render_report("Question?", report, [evidence], [source], "live", "passed", [])
+    assert "## Answer" in output
+    assert output.count("[^1]:") == 1
+    assert "Elong" not in output
+    report.answer = Claim(text="Unsupported answer", evidence_ids=["unknown"])
+    with pytest.raises(ValueError):
+        validate_report(report, [evidence])
+
+
+def test_http_413_is_not_retried_unchanged():
+    from coeus.providers import RequestTooLarge
+
+    async def check():
+        provider = HostedProvider(Settings(_env_file=None, LLM_API_KEY="x", TAVILY_API_KEY="x"))
+        await provider.client.aclose()
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(413)
+
+        provider.client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        try:
+            with pytest.raises(RequestTooLarge):
+                await provider.generate("extract", "Extract", {}, Findings)
+            assert len(requests) == 1
         finally:
             await provider.close()
 

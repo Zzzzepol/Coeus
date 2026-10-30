@@ -18,6 +18,16 @@ class Settings(BaseSettings):
     request_timeout: float = Field(45, ge=1, le=120, validation_alias="COEUS_REQUEST_TIMEOUT")
     run_timeout: float = Field(600, ge=1, le=1800, validation_alias="COEUS_RUN_TIMEOUT")
 
+    extract_chunk_chars: int = Field(
+        4000, ge=1000, le=8000, validation_alias="COEUS_EXTRACT_CHUNK_CHARS"
+    )
+    evidence_budget_bytes: int = Field(
+        8000, ge=4000, le=24000, validation_alias="COEUS_EVIDENCE_BUDGET_BYTES"
+    )
+    llm_max_output_tokens: int = Field(
+        2048, ge=512, le=4096, validation_alias="COEUS_LLM_MAX_OUTPUT_TOKENS"
+    )
+
     def validate_live(self) -> None:
         if not self.tavily_api_key.get_secret_value() or not self.llm_api_key.get_secret_value():
             raise ValueError("Set TAVILY_API_KEY and LLM_API_KEY in .env for live research.")

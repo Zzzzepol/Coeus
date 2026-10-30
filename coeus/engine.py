@@ -4,9 +4,10 @@ from collections.abc import Callable
 from urllib.parse import urlsplit
 
 from coeus.config import Settings
-from coeus.models import Critique, Document, Evidence, Findings, Plan, Report, Source
-from coeus.providers import ProviderError
-from coeus.report import render_report, validate_report
+from coeus.extraction import extract_chunk
+from coeus.models import Critique, Document, Evidence, Plan, Report, Source
+from coeus.providers import ProviderError, RequestTooLarge
+from coeus.report import render_report, report_claims, validate_report
 from coeus.storage import Store
 
 
@@ -76,6 +77,9 @@ class ResearchEngine:
                 "max_tasks": cfg.max_tasks,
                 "results_per_task": cfg.results_per_task,
                 "run_timeout": cfg.run_timeout,
+                "extract_chunk_chars": cfg.extract_chunk_chars,
+                "evidence_budget_bytes": cfg.evidence_budget_bytes,
+                "llm_max_output_tokens": cfg.llm_max_output_tokens,
             },
         )
         emit("Planning research tasks")
@@ -103,8 +107,10 @@ class ResearchEngine:
             sources[source.id] = source
             self.store.put(run_id, "source", source.id, source)
             # Extract across the entire document, in bounded chunks rather than silently truncating it.
-            for offset in range(0, len(doc.text), 10_000):
-                document_sources.append((source, doc.text[offset : offset + 10_000]))
+            for offset in range(0, len(doc.text), cfg.extract_chunk_chars):
+                document_sources.append(
+                    (source, doc.text[offset : offset + cfg.extract_chunk_chars])
+                )
 
         queue = asyncio.Queue()
         for i, task in enumerate(plan.tasks, 1):
@@ -151,31 +157,47 @@ class ResearchEngine:
                         batch = [{**source.model_dump(), "content": chunk}]
                     if not batch:
                         raise ValueError("No usable sources")
-                    findings = await self.provider.generate(
-                        "extract",
-                        "Extract up to 6 relevant findings. Each needs an exact, contiguous quote "
-                        "copied from source content and its source_id. Return no findings if irrelevant.",
-                        {"question": question, "sources": batch},
-                        Findings,
+                    accepted = rejected = failed_chunks = 0
+                    for source_data in batch:
+                        text = source_data["content"]
+                        for offset in range(0, len(text), cfg.extract_chunk_chars):
+                            chunk = text[offset : offset + cfg.extract_chunk_chars]
+                            # Metadata is bounded separately; identifiers and content remain exact.
+                            excerpt = {
+                                **source_data,
+                                "content": chunk,
+                                "title": source_data["title"][:200],
+                                "uri": source_data["uri"][:500],
+                            }
+                            async for findings, error in extract_chunk(
+                                self.provider, question, excerpt
+                            ):
+                                if error:
+                                    failed_chunks += 1
+                                    warnings.append(f"{task_id}: {error}")
+                                    continue
+                                for f in findings.findings:
+                                    if f.source_id != source_data["id"] or f.quote not in chunk:
+                                        rejected += 1
+                                        continue
+                                    item = Evidence(
+                                        **f.model_dump(),
+                                        task_id=task_id,
+                                        id="E"
+                                        + fingerprint(task_id + f.source_id + f.quote + f.claim),
+                                    )
+                                    if not any(e.id == item.id for e in evidence):
+                                        evidence.append(item)
+                                        self.store.put(run_id, "evidence", item.id, item)
+                                        accepted += 1
+                    task_info.update(
+                        status="partial" if failed_chunks else "complete",
+                        findings=accepted,
+                        rejected=rejected,
+                        failed_chunks=failed_chunks,
                     )
-                    allowed = {s["id"]: s["content"] for s in batch}
-                    accepted = 0
-                    for f in findings.findings:
-                        if f.source_id not in allowed or f.quote not in allowed[f.source_id]:
-                            warnings.append(
-                                f"{task_id}: rejected a finding with an unverifiable quote."
-                            )
-                            continue
-                        item = Evidence(
-                            **f.model_dump(),
-                            task_id=task_id,
-                            id="E" + fingerprint(task_id + f.source_id + f.quote + f.claim),
-                        )
-                        if not any(e.id == item.id for e in evidence):
-                            evidence.append(item)
-                            self.store.put(run_id, "evidence", item.id, item)
-                            accepted += 1
-                    task_info.update(status="complete", findings=accepted)
+                    if rejected:
+                        warnings.append(f"{task_id}: rejected {rejected} unverifiable findings.")
                     if accepted == 0:
                         warnings.append(f"{task_id}: no verified relevant findings.")
                 except asyncio.CancelledError:
@@ -194,6 +216,24 @@ class ResearchEngine:
             for _ in range(cfg.workers):
                 group.create_task(worker())
         self.store.put(run_id, "warnings", "warnings", warnings)
+        tasks = list(self.store.get(run_id)["artifacts"].get("task", {}).values())
+        coverage = {
+            "total": len(tasks),
+            "completed": sum(t["status"] == "complete" for t in tasks),
+            "with_evidence": sum(t.get("findings", 0) > 0 for t in tasks),
+            "failed": sum(t["status"] in {"failed", "partial"} for t in tasks),
+            "rejected": sum(t.get("rejected", 0) for t in tasks),
+        }
+        coverage["status"] = (
+            "complete"
+            if (
+                coverage["completed"] == coverage["total"]
+                and coverage["with_evidence"] == coverage["total"]
+                and not coverage["rejected"]
+            )
+            else "partial"
+        )
+        self.store.put(run_id, "coverage", "research", coverage)
         if not evidence:
             emit("No verified evidence was collected; no report will be fabricated")
             raise ValueError("No verified evidence")
@@ -201,30 +241,53 @@ class ResearchEngine:
         evidence.sort(key=lambda e: (e.task_id, e.id))
         selected, used_chars = [], 0
         for e in evidence:
-            size = len(e.model_dump_json())
-            if used_chars + size <= 48_000:
+            size = len(e.model_dump_json().encode("utf-8"))
+            if used_chars + size <= cfg.evidence_budget_bytes:
                 selected.append(e)
                 used_chars += size
+        coverage["evidence_used"] = len(selected)
+        coverage["evidence_collected"] = len(evidence)
         if len(selected) < len(evidence):
+            coverage["status"] = "partial"
             warnings.append(
                 f"Report context uses {len(selected)} of {len(evidence)} findings; "
                 "all findings are retained in SQLite."
             )
+        self.store.put(run_id, "coverage", "research", coverage)
         data = {
             "question": question,
             "evidence": [e.model_dump() for e in selected],
-            "research_warnings": warnings,
+            "coverage": coverage,
         }
         emit("Writing a cited draft")
-        draft = await self.provider.generate(
-            "draft",
-            "Answer using only the evidence. Every claim needs valid evidence_ids. "
-            "Include limitations and distinguish source statements from established conclusions.",
-            data,
-            Report,
-        )
+        for attempt in range(3):
+            try:
+                draft = await self.provider.generate(
+                    "draft",
+                    "Answer using only the evidence. Every claim needs valid evidence_ids. "
+                    "Provide a concise direct answer in answer, with evidence_ids, then practical tradeoffs in "
+                    "claims. Prefer primary evidence. Include limitations and distinguish source statements "
+                    "from established conclusions. Do not repeat the answer verbatim in findings.",
+                    data,
+                    Report,
+                )
+                break
+            except RequestTooLarge:
+                if attempt == 2 or len(selected) <= 1:
+                    raise
+                selected = selected[: max(1, len(selected) // 2)]
+                data["evidence"] = [e.model_dump() for e in selected]
+                coverage.update(status="partial", evidence_used=len(selected))
+                self.store.put(run_id, "coverage", "research", coverage)
+                warnings.append(
+                    "Report evidence context was reduced after a provider size rejection."
+                )
         validate_report(draft, selected)
         self.store.put(run_id, "report", "draft", draft)
+
+        def review_data(report):
+            cited = {ref for c in report_claims(report) for ref in c.evidence_ids}
+            return {**data, "evidence": [e.model_dump() for e in selected if e.id in cited]}
 
         async def critique(report):
             return await self.provider.generate(
@@ -232,7 +295,7 @@ class ResearchEngine:
                 "Audit each claim against its exact evidence quotes. Flag unsupported inference, "
                 "contradictions, missing scope, and misleading certainty. Verdict must be revise "
                 "if any claim is not supported. Suggest concrete repairs.",
-                {**data, "report": report.model_dump()},
+                {**review_data(report), "report": report.model_dump()},
                 Critique,
             )
 
@@ -245,7 +308,11 @@ class ResearchEngine:
                 "revise",
                 "Repair the draft using the critique. Remove unsupported claims. "
                 "Use only the supplied evidence and preserve explicit limitations.",
-                {**data, "draft": draft.model_dump(), "critique": review.model_dump()},
+                {
+                    **review_data(draft),
+                    "draft": draft.model_dump(),
+                    "critique": review.model_dump(),
+                },
                 Report,
             )
             validate_report(draft, selected)
@@ -254,20 +321,29 @@ class ResearchEngine:
         review_status = (
             "passed" if review.verdict == "pass" and not review.issues else "needs review"
         )
-        warnings += [
-            (
-                "Web evidence may be search excerpts or truncated page content; "
-                "citations verify provenance, not factual truth."
-            )
-        ]
         if review_status != "passed":
             warnings += review.issues or ["The critic requested further revision."]
         self.store.put(run_id, "report", "final", draft)
         self.store.put(run_id, "warnings", "warnings", warnings)
         markdown = render_report(
-            question, draft, selected, list(sources.values()), mode, review_status, warnings
+            question,
+            draft,
+            selected,
+            list(sources.values()),
+            mode,
+            review_status,
+            warnings,
+            coverage,
         )
         self.store.finish(
-            run_id, "complete" if review_status == "passed" else "needs_review", markdown
+            run_id,
+            (
+                "needs_review"
+                if review_status != "passed"
+                else "partial"
+                if coverage["status"] == "partial"
+                else "complete"
+            ),
+            markdown,
         )
         emit(f"Report saved — critic {review_status}")
